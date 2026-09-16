@@ -27,10 +27,6 @@ export interface ProcessedEventRepository {
     save(eventId: string): Promise<void>;
 }
 
-export interface UnitOfWork {
-    execute<T>(work: (repos: Repositories) => Promise<T>): Promise<T>;
-}
-
 export interface Repositories {
     conversations: ConversationRepository;
     participants: ConversationParticipantRepository;
@@ -45,8 +41,9 @@ export interface Repositories {
 export interface ConversationRepository {
     save(conversation: Conversation): Promise<void>;
     findById(id: string): Promise<Conversation | null>;
-    findByUser(userId: string, limit?: number): Promise<Conversation[]>;
-    findByIdWithParticipants(id: string): Promise<Conversation | null>;
+    findDirectByParticipants(organizationId: string, userIdA: string, userIdB: string): Promise<Conversation | null>;
+    findByUser(userId: string, organizationId: string, limit?: number): Promise<Conversation[]>;
+    findByIdWithParticipants(id: string): Promise<{ conversation: Conversation; participants: ConversationParticipant[] } | null>;
     updateLastMessageAt(id: string, at: Date): Promise<void>;
 }
 
@@ -83,4 +80,5 @@ export interface MessageDeletionRepository {
     save(deletion: MessageDeletion): Promise<void>;
     exists(messageId: string, userId: string): Promise<boolean>;
     findByMessage(messageId: string): Promise<MessageDeletion[]>;
+    findByConversationAndUser(conversationId: string, userId: string): Promise<MessageDeletion[]>;
 }

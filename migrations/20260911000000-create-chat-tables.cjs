@@ -7,12 +7,14 @@ module.exports = {
             type: { type: Sequelize.ENUM('direct', 'group'), allowNull: false },
             title: { type: Sequelize.STRING(200), allowNull: true },
             created_by: { type: Sequelize.CHAR(36), allowNull: false },
+            organization_id: { type: Sequelize.CHAR(36), allowNull: false },
             is_active: { type: Sequelize.BOOLEAN, allowNull: false, defaultValue: true },
             last_message_at: { type: Sequelize.DATE, allowNull: true },
             created_at: { type: Sequelize.DATE, allowNull: false },
             updated_at: { type: Sequelize.DATE, allowNull: false },
         });
         await queryInterface.addIndex('conversations', ['last_message_at']);
+        await queryInterface.addIndex('conversations', ['organization_id', 'last_message_at']);
 
         /* 2.- Create conversation_participants table */
         await queryInterface.createTable('conversation_participants', {

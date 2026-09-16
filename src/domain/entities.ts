@@ -4,6 +4,7 @@ import { BusinessRuleError, ValidationError } from './errors.js';
 
 export interface ConversationProps {
     id: string;
+    organizationId: string;
     type: ConversationType;
     title: string | null;
     createdBy: string;
@@ -16,14 +17,15 @@ export interface ConversationProps {
 export class Conversation {
     private constructor(private props: ConversationProps){}
 
-    static create(params: { type: ConversationType; title?: string | null; createdBy: string}): Conversation {
-        if(params.type === 'group' && !params.title){
+    static create(params: { organizationId: string; type: ConversationType; title?: string | null; createdBy: string}): Conversation {
+        if (params.type === 'group' && !params.title) {
             throw new BusinessRuleError('Un grupo requiere título');
         }
 
         const now = new Date();
         return new Conversation({
             id: randomUUID(),
+            organizationId: params.organizationId, 
             type: params.type,
             title: params.title ?? null,
             createdBy: params.createdBy,
@@ -39,6 +41,7 @@ export class Conversation {
     }
 
     get id(): string { return this.props.id; }
+    get organizationId(): string { return this.props.organizationId; }
     get type(): ConversationType { return this.props.type; }
     get title(): string | null { return this.props.title; }
     get createdBy(): string { return this.props.createdBy; }
@@ -48,9 +51,13 @@ export class Conversation {
     get updatedAt(): Date { return this.props.updatedAt; }
 
     isGroup(): boolean { return this.props.type === 'group'; }
+    
+    belongsToOrganization(orgId: string): boolean {
+        return this.props.organizationId === orgId;
+    }
 
     rename(title: string): void {
-        if(!this.isGroup()) throw new BusinessRuleError('No se puede renombrar una conversación directa');
+        if (!this.isGroup()) throw new BusinessRuleError('No se puede renombrar una conversación directa');
         this.props.title = title;
         this.props.updatedAt = new Date();
     }
@@ -172,10 +179,10 @@ export class Message {
         attachmentUrl?: string | null; 
         replyTo?: string | null
     }): Message {
-        if(params.contentType === 'text' && params.content.trim().length === 0){
+        if (params.contentType === 'text' && params.content.trim().length === 0) {
             throw new ValidationError('El contenido del mensaje no puede estar vacío');
         }
-        if(params.contentType !== 'text' && !params.attachmentId){
+        if (params.contentType !== 'text' && !params.attachmentId) {
             throw new ValidationError('Un adjunto requiere un attachmentId');
         }
 
@@ -217,7 +224,7 @@ export class Message {
     isDeleted(): boolean { return this.props.status === 'deleted'; }
 
     private transition(to: MessageStatus): void {
-        if(!MessageStatus.canTransition(this.props.status, to)){
+        if (!MessageStatus.canTransition(this.props.status, to)) {
             throw new BusinessRuleError(`No se puede cambiar el estado de ${this.props.status} a ${to}`);
         }
         this.props.status = to;
@@ -238,8 +245,8 @@ export class Message {
     }
 
     edit(newContent: string, editedBy: string, at: Date): MessageVersion {
-        if(this.isDeleted()) throw new BusinessRuleError('No se puede editar un mensaje borrado');
-        if(!isValidUuid(editedBy)) throw new ValidationError('editedBy inválido');
+        if (this.isDeleted()) throw new BusinessRuleError('No se puede editar un mensaje borrado');
+        if (!isValidUuid(editedBy)) throw new ValidationError('editedBy inválido');
         const version = MessageVersion.create({
             messageId: this.props.id,
             content: this.props.content,
@@ -284,7 +291,7 @@ export class ParticipantMessage {
     get statusAt(): Date { return this.props.statusAt; }
 
     markAsRead(at: Date): void {
-        if(this.props.status === 'read') return;
+        if (this.props.status === 'read') return;
         this.props.status = 'read';
         this.props.statusAt = at;
     }

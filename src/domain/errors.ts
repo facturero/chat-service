@@ -36,6 +36,14 @@ export class ForbiddenError extends AppError {
     }
 }
 
+// Error code 403 - The user is not a member of the context organization.
+export class NotOrganizationMemberError extends AppError {
+    constructor(userId: string, organizationId: string) {
+        super('NOT_ORGANIZATION_MEMBER', 403, `El usuario ${userId} no es miembro de la organización ${organizationId}`);
+        this.name = 'NotOrganizationMemberError';
+    }
+}
+
 // Error code 404 - Not found
 export class NotFoundError extends AppError {
     constructor(resource: string, id?: string) {

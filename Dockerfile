@@ -16,7 +16,8 @@ RUN addgroup --system app && adduser --system --ingroup app app
 COPY package*.json ./
 RUN printf '@facturero:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > .npmrc \
     && npm ci --omit=dev && npm cache clean --force \
-    && rm -f .npmrc
+    && rm -f .npmrc \
+    && npm i -g sequelize-cli@^6.6.2
 COPY --from=builder /app/dist/ dist/
 COPY migrations/ migrations/
 COPY .sequelizerc .sequelizerc

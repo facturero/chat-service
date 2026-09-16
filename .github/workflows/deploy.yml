@@ -60,7 +60,7 @@ jobs:
           context: .
           platforms: linux/amd64
           build-args: |
-            NODE_AUTH_TOKEN=${{ secrets.NODE_AUTH_TOKEN }}
+            NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}

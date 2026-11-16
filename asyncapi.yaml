@@ -1,0 +1,214 @@
+asyncapi: 2.6.0
+info:
+  title: chat-service — eventos
+  version: 2.0.0
+  description: >-
+    chat-service PUBLICA estos eventos en el exchange `crm.events` (patrón Outbox, @facturero/outbox-relay; RabbitMQ es el de
+    `backend/rabbitmq-basic`, el mismo de todos los servicios) y CONSUME tres de auth-service (cola `chat-service.events`, InboxConsumer,
+    idempotente por `processed_events`).
+
+    Todo payload lleva `organizationId` y `conversationId`; el relay añade actor, IP y request-id. Destinatarios calculados aquí, solo
+    ids: `memberUserIds` (a quién reenvía el hub del gateway por socket, sin el autor), `notifyUserIds` (notificación del navegador),
+    `hereUserIds` (avisados por @aquí si están conectados; lo filtra el hub) y `userIds` (campana: lo leen notification-service y el gateway,
+    como en Proyectos).
+
+    PRIVACIDAD: ningún evento lleva el texto de un mensaje (InboxConsumer guarda cada payload en `processed_events` del consumidor, y
+    audit-log consume `#`). El hub del gateway pide el mensaje a chat-service (`GET /internal/messages/:id`) para entregarlo por socket.
+    audit-log-service excluye por ruido `chat.message.*`, `chat.reaction.*`, `chat.member.*` y `chat.conversation.read`: a la bitácora
+    solo van `chat.conversation.created|updated|archived|unarchived` (etiquetas `audit.event.chat_conversation_*` en el frontend).
+
+    Contrato de Socket.IO que resulta de estos eventos: `docs/tiempo-real.md`.
+channels:
+  chat.conversation.created:
+    publish:
+      summary: Se creó un canal o un DM. Canal público → aviso a la organización; privado y DM → a sus miembros
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/ConversationPayload'
+            - type: object
+              properties:
+                createdBy: { type: string, format: uuid }
+                isGeneral: { type: boolean, description: 'El #general que se crea solo al primer uso' }
+  chat.conversation.updated:
+    publish:
+      summary: Cambió el nombre, el tema o la descripción de un canal
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/ConversationPayload'
+            - type: object
+              properties:
+                changes: { type: array, items: { type: string, enum: [name, topic, description] } }
+  chat.conversation.archived:
+    publish:
+      summary: Canal archivado (solo lectura)
+      message: { payload: { $ref: '#/components/schemas/ConversationPayload' } }
+  chat.conversation.unarchived:
+    publish:
+      summary: Canal desarchivado
+      message: { payload: { $ref: '#/components/schemas/ConversationPayload' } }
+  chat.conversation.read:
+    publish:
+      summary: Alguien avanzó su cursor de leído. Solo para sincronizar sus propias pestañas y equipos (no audita, no avisa)
+      message:
+        payload:
+          type: object
+          required: [organizationId, conversationId, userId, lastReadSeq]
+          properties:
+            organizationId: { type: string, format: uuid }
+            conversationId: { type: string, format: uuid }
+            userId: { type: string, format: uuid }
+            lastReadSeq: { type: integer }
+  chat.member.joined:
+    publish:
+      summary: 'Alguien entró a un canal (se unió, lo agregaron, o llegó al equipo y entró a #general)'
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/MemberPayload'
+            - type: object
+              properties:
+                reason: { type: string, enum: [joined, added, onboarding] }
+  chat.member.left:
+    publish:
+      summary: Alguien salió de un canal (salió, lo quitaron, o fue deshabilitado en la organización)
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/MemberPayload'
+            - type: object
+              properties:
+                reason: { type: string, enum: [left, removed, deactivated] }
+  chat.message.created:
+    publish:
+      summary: 'Mensaje nuevo (raíz o respuesta de hilo). Sin texto: el hub lo pide a chat-service para entregarlo'
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/Recipients'
+            - $ref: '#/components/schemas/MessageRef'
+            - type: object
+              properties:
+                kind: { type: string, enum: [channel, dm, group_dm] }
+                conversationName: { type: string, nullable: true, description: 'Para la campana («Nuevo mensaje de Ana en #ventas»); null en DMs' }
+  chat.message.updated:
+    publish:
+      summary: 'Se editó un mensaje (sin texto: el hub lo vuelve a pedir)'
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/Recipients'
+            - $ref: '#/components/schemas/MessageRef'
+  chat.message.deleted:
+    publish:
+      summary: 'Se borró un mensaje (sin texto: solo la lápida)'
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/Recipients'
+            - type: object
+              required: [messageId]
+              properties:
+                messageId: { type: string, format: uuid }
+                threadRootId: { type: string, format: uuid, nullable: true }
+                deletedBy: { type: string, format: uuid }
+                byAdmin: { type: boolean, description: Lo borró `chat:admin` y no su autor }
+  chat.reaction.added:
+    publish:
+      summary: Alguien reaccionó
+      message: { payload: { $ref: '#/components/schemas/ReactionPayload' } }
+  chat.reaction.removed:
+    publish:
+      summary: Alguien quitó su reacción
+      message: { payload: { $ref: '#/components/schemas/ReactionPayload' } }
+
+  identity.user.accepted_invite:
+    subscribe:
+      summary: 'Lo publica auth-service. La persona entra a #general de esa organización (si ya existe)'
+      message:
+        payload:
+          type: object
+          required: [userId, organizationId]
+          properties:
+            userId: { type: string, format: uuid }
+            organizationId: { type: string, format: uuid }
+  identity.user.disabled:
+    subscribe:
+      summary: Lo publica auth-service. Se marca inactiva (`inactive_users`), sale de los canales y sus DMs quedan de solo lectura
+      message:
+        payload:
+          type: object
+          required: [userId, organizationId]
+          properties:
+            userId: { type: string, format: uuid }
+            organizationId: { type: string, format: uuid }
+  identity.user.enabled:
+    subscribe:
+      summary: 'Lo publica auth-service. Deja de estar inactiva y vuelve a #general (los demás canales hay que volver a unirse)'
+      message:
+        payload:
+          type: object
+          required: [userId, organizationId]
+          properties:
+            userId: { type: string, format: uuid }
+            organizationId: { type: string, format: uuid }
+
+components:
+  schemas:
+    ConversationPayload:
+      type: object
+      required: [organizationId, conversationId, kind]
+      properties:
+        organizationId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        kind: { type: string, enum: [channel, dm, group_dm] }
+        visibility: { type: string, enum: [public, private], nullable: true }
+        name: { type: string, nullable: true, description: Solo canales (lo usa la bitácora) }
+        memberUserIds:
+          type: array
+          items: { type: string, format: uuid }
+          description: Privados y DMs; vacío en canales públicos (el hub avisa a la organización entera con un aviso mínimo)
+    MemberPayload:
+      type: object
+      required: [organizationId, conversationId, userIds]
+      properties:
+        organizationId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        kind: { type: string, enum: [channel, dm, group_dm] }
+        visibility: { type: string, enum: [public, private], nullable: true }
+        userIds: { type: array, items: { type: string, format: uuid }, description: Quiénes entraron o salieron }
+        memberUserIds: { type: array, items: { type: string, format: uuid }, description: Miembros tras el cambio (para refrescar su lista) }
+    Recipients:
+      type: object
+      required: [organizationId, conversationId, memberUserIds]
+      properties:
+        organizationId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        memberUserIds: { type: array, items: { type: string, format: uuid } }
+        notifyUserIds: { type: array, items: { type: string, format: uuid } }
+        hereUserIds: { type: array, items: { type: string, format: uuid } }
+        userIds: { type: array, items: { type: string, format: uuid }, description: Campana (solo en chat.message.created) }
+    MessageRef:
+      type: object
+      description: 'Referencia a un mensaje, SIN texto ni documento (regla 10 de IMPLEMENTATION.md)'
+      required: [messageId, senderId]
+      properties:
+        messageId: { type: string, format: uuid }
+        seq: { type: integer, nullable: true }
+        threadRootId: { type: string, format: uuid, nullable: true }
+        threadSeq: { type: integer, nullable: true }
+        senderId: { type: string, format: uuid, nullable: true }
+        messageKind: { type: string, enum: [user, system] }
+        mentionUserIds: { type: array, items: { type: string, format: uuid } }
+        createdAt: { type: string, format: date-time }
+    ReactionPayload:
+      allOf:
+        - $ref: '#/components/schemas/Recipients'
+        - type: object
+          required: [messageId, emoji, userId]
+          properties:
+            messageId: { type: string, format: uuid }
+            threadRootId: { type: string, format: uuid, nullable: true }
+            emoji: { type: string }
+            userId: { type: string, format: uuid }

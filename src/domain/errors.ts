@@ -1,77 +1,108 @@
-
-
-export class AppError extends Error {
-    constructor(
-        public readonly code: string,
-        public readonly httpStatus: number,
-        message: string,
-        public readonly details?: Record<string, unknown>
-    ){
-        super(message);
-        this.name = 'AppError';
-    }
+export interface ErrorDetail {
+  field: string;
+  message: string;
 }
 
-// Error code 400 - validation errors
+/** Error de negocio con su código y su estado HTTP. El formato de respuesta es el de todos los servicios: `{ code, message, details? }`. */
+export abstract class AppError extends Error {
+  abstract readonly code: string;
+  abstract readonly httpStatus: number;
+  readonly details?: ErrorDetail[];
+
+  constructor(message: string, details?: ErrorDetail[]) {
+    super(message);
+    this.name = new.target.name;
+    this.details = details;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export class ValidationError extends AppError {
-    constructor(message: string, details?: Record<string, unknown>) {
-        super('VALIDATION_ERROR', 400, message, details);
-        this.name = 'ValidationError';
-    }
+  readonly code = 'VALIDATION_ERROR';
+  readonly httpStatus = 422;
+  constructor(details: ErrorDetail[], message = 'La petición no es válida.') {
+    super(message, details);
+  }
 }
 
-// Error code 401 - authentication errors
-export class UnauthorizedError extends AppError {
-    constructor(message = 'Not authorized') {
-        super('UNAUTHORIZED', 401, message);
-        this.name = 'UnauthorizedError';
-    }
+export class OrganizationContextRequiredError extends AppError {
+  readonly code = 'ORG_CONTEXT_REQUIRED';
+  readonly httpStatus = 401;
+  constructor(message = 'Falta el contexto de organización.') { super(message); }
 }
 
-// Error code 403 - You do not have permission -> (no es participante, no es autor/admin)
+export class UserContextRequiredError extends AppError {
+  readonly code = 'USER_CONTEXT_REQUIRED';
+  readonly httpStatus = 401;
+  constructor(message = 'Falta el contexto de usuario.') { super(message); }
+}
+
+export class InternalAuthError extends AppError {
+  readonly code = 'INTERNAL_AUTH_REQUIRED';
+  readonly httpStatus = 401;
+  constructor(message = 'Falta o no coincide el secreto interno.') { super(message); }
+}
+
+/** Puede leer la conversación pero no hacer esto (no es el dueño, no es el autor…). */
 export class ForbiddenError extends AppError {
-    constructor(message = 'Access denied') {
-        super('FORBIDDEN', 403, message);
-        this.name = 'ForbiddenError';
-    }
+  readonly code = 'FORBIDDEN';
+  readonly httpStatus = 403;
+  constructor(message = 'No puedes hacer esto en esta conversación.') { super(message); }
 }
 
-// Error code 403 - The user is not a member of the context organization.
-export class NotOrganizationMemberError extends AppError {
-    constructor(userId: string, organizationId: string) {
-        super('NOT_ORGANIZATION_MEMBER', 403, `El usuario ${userId} no es miembro de la organización ${organizationId}`);
-        this.name = 'NotOrganizationMemberError';
-    }
+/**
+ * No existe, es de otra organización, o es un canal privado / DM donde no se es miembro: siempre el mismo 404. Un 403 diría que existe.
+ */
+export class EmojiNotFoundError extends AppError {
+  readonly code = 'EMOJI_NOT_FOUND';
+  readonly httpStatus = 404;
+  constructor(message = 'Ese emoji no existe.') { super(message); }
 }
 
-// Error code 404 - Not found
-export class NotFoundError extends AppError {
-    constructor(resource: string, id?: string) {
-        super('NOT_FOUND', 404, `${resource} ${id ? `with id ${id} ` : ''}not found`);
-        this.name = 'NotFoundError';
-    }
+export class ConversationNotFoundError extends AppError {
+  readonly code = 'CONVERSATION_NOT_FOUND';
+  readonly httpStatus = 404;
+  constructor(message = 'Conversación no encontrada.') { super(message); }
 }
 
-// Error code 409 - Conflict
-export class ConflictError extends AppError {
-    constructor(message: string) {
-        super('CONFLICT', 409, message);
-        this.name = 'ConflictError';
-    }
+export class MessageNotFoundError extends AppError {
+  readonly code = 'MESSAGE_NOT_FOUND';
+  readonly httpStatus = 404;
+  constructor(message = 'Mensaje no encontrado.') { super(message); }
 }
 
-// Error code 422 - Business rule violated
-export class BusinessRuleError extends AppError {
-    constructor(message: string) {
-        super('BUSINESS_RULE_VIOLATION', 422, message);
-        this.name = 'BusinessRuleError';
-    }
+export class ConversationArchivedError extends AppError {
+  readonly code = 'CONVERSATION_ARCHIVED';
+  readonly httpStatus = 409;
+  constructor(message = 'El canal está archivado: es de solo lectura.') { super(message); }
 }
 
-// Error code 500 - Internal server error
-export class InternalServerError extends AppError {
-    constructor(message = 'Internal server error') {
-        super('INTERNAL_SERVER_ERROR', 500, message);
-        this.name = 'InternalServerError';
-    }
+export class NameTakenError extends AppError {
+  readonly code = 'NAME_TAKEN';
+  readonly httpStatus = 409;
+  constructor(message = 'Ya existe un canal con ese nombre.') { super(message); }
+}
+
+export class GeneralIsMandatoryError extends AppError {
+  readonly code = 'GENERAL_IS_MANDATORY';
+  readonly httpStatus = 409;
+  constructor(message = 'Nadie sale de #general ni se puede archivar.') { super(message); }
+}
+
+export class UserInactiveError extends AppError {
+  readonly code = 'USER_INACTIVE';
+  readonly httpStatus = 409;
+  constructor(message = 'Esa persona ya no está activa en la organización.') { super(message); }
+}
+
+export class NotApplicableError extends AppError {
+  readonly code = 'NOT_APPLICABLE';
+  readonly httpStatus = 409;
+  constructor(message = 'Esto no aplica a este tipo de conversación.') { super(message); }
+}
+
+export class RateLimitedError extends AppError {
+  readonly code = 'RATE_LIMITED';
+  readonly httpStatus = 429;
+  constructor(message = 'Demasiados mensajes seguidos. Espera un momento.') { super(message); }
 }

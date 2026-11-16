@@ -92,6 +92,15 @@ spec:
                 secretKeyRef:
                   name: chat-rabbitmq
                   key: url
+            # Equipo de la organización para crear #general (GET /internal/organizations/:id/contacts de auth) y secreto de las rutas
+            # /internal/* (las llama el hub del gateway). El Secret `internal-service-secret` ya existe en el clúster.
+            - name: AUTH_SERVICE_URL
+              value: "http://auth-service-node:3001"
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: internal-service-secret
+                  key: value
             - name: CORS_ORIGIN
               value: "https://steep-geology-napping.ngrok-free.dev"
             - name: OTEL_SERVICE_NAME

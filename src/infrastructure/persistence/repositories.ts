@@ -1,469 +1,642 @@
-import { Op, Transaction } from 'sequelize';
-import { sequelize } from './sequelize.js';
-import {
-  ConversationModel,
-  ConversationParticipantModel,
-  MessageModel,
-  MessageDeletionModel,
-  MessageVersionModel,
-  OutboxModel,
-  ParticipantMessageModel,
-  ProcessedEventModel,
-} from './models.js';
-import {
-  Conversation,
-  ConversationParticipant,
-  Message,
-  MessageDeletion,
-  MessageVersion,
-  ParticipantMessage,
-} from '../../domain/entities.js';
-import {
-  ConversationParticipantRepository,
+import { QueryTypes, type Transaction } from 'sequelize';
+import { withActor } from '@facturero/outbox-relay';
+import type { UnitOfWorkGateway, WriteUnitOfWork } from '../../application/ports.js';
+import type {
+  ChannelListing,
   ConversationRepository,
   DomainEvent,
-  MessageDeletionRepository,
+  EmojiRepository,
+  InactiveUserRepository,
+  MemberRepository,
+  MentionRepository,
+  MessagePageQuery,
   MessageRepository,
-  MessageVersionRepository,
   OutboxRepository,
-  ParticipantMessageRepository,
-  ProcessedEventRepository,
+  ReactionGroup,
+  ReactionRepository,
   Repositories,
+  ThreadFollowerRepository,
+  UnreadCounts,
 } from '../../domain/repositories.js';
-import { UnitOfWork } from '../../application/ports.js';
-import { withActor } from '@facturero/outbox-relay';
+import type { Conversation, CustomEmoji, Member, Message, NotifyLevel } from '../../domain/types.js';
+import { sequelize } from './sequelize.js';
 
-function toConversation(m: ConversationModel): Conversation{
-    return Conversation.fromPersistence({
-        id: m.id,
-        organizationId: m.organization_id,
-        type: m.type,
-        title: m.title,
-        createdBy: m.created_by,
-        isActive: m.is_active,
-        lastMessageAt: m.last_message_at,
-        createdAt: m.created_at,
-        updatedAt: m.updated_at,
-    });
-}
+/**
+ * Persistencia en MySQL con SQL a la vista (regla 15 de IMPLEMENTATION.md): los «insertar si no existe» son `INSERT IGNORE` contra un
+ * UNIQUE, el `seq` se decide con `SELECT … FOR UPDATE` y la lectura tras perder una carrera usa `LOCK IN SHARE MODE`. Así la concurrencia
+ * se ve en el código y `scripts/verify-chat.mjs` la prueba contra MySQL real.
+ *
+ * - mysql2 ya entrega las columnas JSON decodificadas: no se vuelven a parsear (bug visto en projects-service).
+ * - BIGINT y COUNT pueden llegar como texto según el driver: todo número pasa por `Number()`.
+ */
 
-function toParticipant(m: ConversationParticipantModel): ConversationParticipant{
-    return ConversationParticipant.fromPersistence({
-        conversationId: m.conversation_id,
-        userId: m.user_id,
-        role: m.role,
-        joinedAt: m.joined_at,
-        lastReadAt: m.last_read_at,
-        leftAt: m.left_at,
-    });
-}
+type Row = Record<string, unknown>;
 
-function toMessage(m: MessageModel): Message{
-    return Message.fromPersistence({
-        id: m.id,
-        conversationId: m.conversation_id,
-        senderId: m.sender_id,
-        contentType: m.content_type,
-        content: m.content ?? '',
-        attachmentId: m.attachment_id,
-        attachmentUrl: m.attachment_url,
-        status: m.status,
-        deliveredAt: m.delivered_at,
-        readAt: m.read_at,
-        editedAt: m.edited_at,
-        replyTo: m.reply_to,
-        createdAt: m.created_at,
-    });
-}
-
-function toParticipantMessage(m: ParticipantMessageModel): ParticipantMessage{
-    return ParticipantMessage.fromPersistence({
-        messageId: m.message_id,
-        participantUserId: m.participant_user_id,
-        status: m.status,
-        statusAt: m.status_at,
-    });
-}
-
-function toMessageVersion(m: MessageVersionModel): MessageVersion{
-    return MessageVersion.fromPersistence({
-        id: m.id,
-        messageId: m.message_id,
-        content: m.content,
-        editedBy: m.edited_by,
-        editedAt: m.edited_at,
-    });
-}
-
-function toMessageDeletion(m: MessageDeletionModel): MessageDeletion{
-    return MessageDeletion.fromPersistence({
-        id: m.id,
-        messageId: m.message_id,
-        deletedBy: m.deleted_by,
-        deletedAt: m.deleted_at,
-    });
-}
-
-function conversationRepository(tx?: Transaction): ConversationRepository {
-    return{
-        async save(conversation: Conversation){
-            const p = conversation.toPersistence();
-            await ConversationModel.upsert(
-                {
-                    id: p.id,
-                    type: p.type,
-                    title: p.title,
-                    created_by: p.createdBy,
-                    organization_id: p.organizationId,
-                    is_active: p.isActive,
-                    last_message_at: p.lastMessageAt,
-                    created_at: p.createdAt,
-                    updated_at: p.updatedAt,
-                },
-                { transaction: tx },
-            );
-        },
-
-        async findById(id: string){
-            const m = await ConversationModel.findByPk(id, { transaction: tx });
-            return m ? toConversation(m) : null;
-        },
-
-        async  findDirectByParticipants(organizationId: string, userIdA: string, userIdB: string){
-            const rows = await ConversationParticipantModel.findAll({
-                where: { user_id: { [Op.in]: [userIdA, userIdB] }},
-                include: [
-                    {
-                    model: ConversationModel,
-                    as: 'conversation',
-                    where: { organization_id: organizationId, type: 'direct', is_active: true },
-                    }
-                ],
-                transaction: tx,
-            });
-
-            const byConversation = new Map<string, string[]>();
-            for (const row of rows){
-                if (row.left_at) continue;
-                const list = byConversation.get(row.conversation_id) ?? [];
-                list.push(row.user_id);
-                byConversation.set(row.conversation_id, list);
-                if (row.conversation && list.includes(userIdA) && list.includes(userIdB)){
-                    return toConversation(row.conversation);
-                }
-            }
-            return null;
-        },
-
-        async findByUser(userId: string, organizationId: string, limit = 50){
-            const rows = await ConversationParticipantModel.findAll({
-                where: { user_id: userId, left_at: null },
-                include: [{ model: ConversationModel, as: 'conversation', where: { organization_id: organizationId } }],
-                order: [[{ model: ConversationModel, as: 'conversation' }, 'last_message_at', 'DESC']],
-                limit,
-                transaction: tx,
-            });
-            return rows.map((r) => toConversation(r.conversation!));
-        },
-
-        async findByIdWithParticipants(id: string){
-            const m = await ConversationModel.findByPk(id, {
-                include: [{ model: ConversationParticipantModel, as: 'participants' }],
-                transaction: tx,
-            });
-            if (!m) return null;
-            return {
-                conversation: toConversation(m),
-                participants: (m.participants ?? []).map(toParticipant),
-            };
-        },
-
-        async  updateLastMessageAt(id: string, at: Date){
-            await ConversationModel.update(
-                { last_message_at: at, updated_at: new Date() },
-                { where: { id }, transaction: tx },
-            ); 
-        }
+const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(v));
+const date = (v: unknown): Date | null => (v === null || v === undefined ? null : v instanceof Date ? v : new Date(String(v)));
+const json = <T>(v: unknown, fallback: T): T => {
+  if (v === null || v === undefined) return fallback;
+  if (typeof v === 'string') {
+    // Algunos drivers (MariaDB) devuelven el JSON como texto; mysql2 contra MySQL ya lo decodifica.
+    try {
+      return JSON.parse(v) as T;
+    } catch {
+      return fallback;
     }
+  }
+  return v as T;
+};
+
+function toConversation(r: Row): Conversation {
+  return {
+    id: String(r.id),
+    organizationId: String(r.organization_id),
+    kind: r.kind as Conversation['kind'],
+    visibility: (r.visibility as Conversation['visibility']) ?? null,
+    name: (r.name as string | null) ?? null,
+    nameKey: (r.name_key as string | null) ?? null,
+    topic: (r.topic as string | null) ?? null,
+    description: (r.description as string | null) ?? null,
+    isGeneral: Boolean(r.is_general),
+    dmKey: (r.dm_key as string | null) ?? null,
+    createdBy: String(r.created_by),
+    archivedAt: date(r.archived_at),
+    messageSeq: num(r.message_seq),
+    lastMessageAt: date(r.last_message_at),
+    createdAt: date(r.created_at)!,
+    updatedAt: date(r.updated_at)!,
+  };
 }
 
-function participantRepository(tx?: Transaction): ConversationParticipantRepository {
-    return {
-        async save(participant: ConversationParticipant){
-            const p = participant.toPersistence();
-            await ConversationParticipantModel.upsert(
-                {
-                    conversation_id: p.conversationId,
-                    user_id: p.userId,
-                    role: p.role,
-                    joined_at: p.joinedAt,
-                    last_read_at: p.lastReadAt,
-                    left_at: p.leftAt,
-                },
-                { transaction: tx }
-            );
-        },
-
-        async findByConversation(conversationId: string){
-            const rows = await ConversationParticipantModel.findAll({
-                where: { conversation_id: conversationId },
-                order: [['joined_at', 'ASC']],
-                transaction: tx,
-            });
-            return rows.map(toParticipant);
-        },
-
-        async findByConversationAndUser(conversationId: string, userId: string){
-            const m = await ConversationParticipantModel.findOne({
-                where: { conversation_id: conversationId, user_id: userId },
-                transaction: tx,
-            });
-            return m ? toParticipant(m) : null;
-        },
-
-        async updateLastReadAt(conversationId: string, userId: string, at: Date){
-            await ConversationParticipantModel.update(
-                { last_read_at: at },
-                { where: { conversation_id: conversationId, user_id: userId }, transaction: tx }
-            );
-        },
-
-        async delete(conversationId: string, userId: string){
-            await ConversationParticipantModel.update(
-                { left_at: new Date() },
-                { where: { conversation_id: conversationId, user_id: userId }, transaction: tx }
-            );
-        },
-    }
+function toMember(r: Row, prefix = ''): Member {
+  return {
+    conversationId: String(r[`${prefix}conversation_id`]),
+    userId: String(r[`${prefix}user_id`]),
+    organizationId: String(r[`${prefix}organization_id`]),
+    role: r[`${prefix}role`] as Member['role'],
+    notify: r[`${prefix}notify`] as NotifyLevel,
+    muted: Boolean(r[`${prefix}muted`]),
+    lastReadSeq: num(r[`${prefix}last_read_seq`]),
+    joinedAt: date(r[`${prefix}joined_at`])!,
+  };
 }
 
-function messageRepository(tx?: Transaction): MessageRepository {
-    return {
-        async save(message: Message){
-            const p = message.toPersistence();
-            await MessageModel.upsert(
-                {
-                    id: p.id,
-                    conversation_id: p.conversationId,
-                    sender_id: p.senderId,
-                    content_type: p.contentType,
-                    content: p.content,
-                    attachment_id: p.attachmentId,
-                    attachment_url: p.attachmentUrl,
-                    status: p.status,
-                    delivered_at: p.deliveredAt,
-                    read_at: p.readAt,
-                    edited_at: p.editedAt,
-                    reply_to: p.replyTo,
-                    created_at: p.createdAt,
-                },
-                { transaction: tx }
-            );
-        },
+/**
+ * Lo que una persona puede leer (`canRead` de domain/access.ts) en SQL, con `c` = la conversación y `:userId` = quien mira: un canal
+ * público, o una conversación de la que es miembro. Quien salió de un canal privado sigue en `thread_followers`, pero sus hilos ya no
+ * le salen ni le cuentan.
+ */
+const READABLE = `((c.kind = 'channel' AND c.visibility = 'public')
+  OR EXISTS (SELECT 1 FROM conversation_members rm WHERE rm.conversation_id = c.id AND rm.user_id = :userId))`;
 
-        async  findById(id: string){
-            const m = await MessageModel.findByPk(id, { transaction: tx });
-            return m ? toMessage(m) : null;
-        },
-
-        async findByConversation(conversationId: string, cursor?: Date, limit = 50){
-            const rows = await MessageModel.findAll({
-                where: {
-                    conversation_id: conversationId,
-                    ...(cursor ? { created_at: { [Op.lt]: cursor } } : {}),
-                },
-                order: [['created_at', 'DESC']],
-                limit,
-                transaction: tx,
-            });
-            return rows.map(toMessage);
-        },
-
-        async updateStatus(id: string, status: string, at?: Date){
-            const patch: Record<string, unknown> = { status };
-            if (status === 'delivered') patch.delivered_at = at ?? new Date();
-            if (status === 'read') patch.read_at = at ?? new Date();
-            await MessageModel.update(patch, { where: { id }, transaction: tx });
-        },
-
-        async updateContent(id: string, newContent: string, editedAt: Date){
-            await MessageModel.update(
-                { content: newContent, edited_at: editedAt },
-                { where: { id }, transaction: tx }
-            );
-        },
-
-        async markDeleted(id: string){
-            await MessageModel.update({ status: 'deleted' }, { where: { id }, transaction: tx });
-        },
-    }
+function toMessage(r: Row): Message {
+  return {
+    id: String(r.id),
+    organizationId: String(r.organization_id),
+    conversationId: String(r.conversation_id),
+    seq: r.seq === null ? null : num(r.seq),
+    threadRootId: (r.thread_root_id as string | null) ?? null,
+    threadSeq: r.thread_seq === null ? null : num(r.thread_seq),
+    senderId: (r.sender_id as string | null) ?? null,
+    kind: r.kind as Message['kind'],
+    bodyDoc: json<Record<string, unknown> | null>(r.body_doc, null),
+    bodyText: (r.body_text as string | null) ?? null,
+    clientMsgId: (r.client_msg_id as string | null) ?? null,
+    replyCount: num(r.reply_count),
+    lastReplyAt: date(r.last_reply_at),
+    replyUserIds: json<string[]>(r.reply_user_ids, []),
+    editedAt: date(r.edited_at),
+    deletedAt: date(r.deleted_at),
+    deletedBy: (r.deleted_by as string | null) ?? null,
+    createdAt: date(r.created_at)!,
+  };
 }
 
-function participantMessageRepository(tx?: Transaction): ParticipantMessageRepository {
-    return {
-        async save(pm: ParticipantMessage){
-            const p = pm.toPersistence();
-            await ParticipantMessageModel.upsert(
-                {
-                    message_id: p.messageId,
-                    participant_user_id: p.participantUserId,
-                    status: p.status,
-                    status_at: p.statusAt,
-                },
-                { transaction: tx }
-            );
-        },
+export function buildRepositories(tx?: Transaction): Repositories {
+  const select = (sql: string, replacements: Record<string, unknown> = {}): Promise<Row[]> =>
+    sequelize.query<Row>(sql, { replacements, type: QueryTypes.SELECT, transaction: tx });
+  /** Devuelve las filas afectadas (INSERT IGNORE que chocó con un UNIQUE = 0). */
+  const write = async (sql: string, replacements: Record<string, unknown> = {}): Promise<number> => {
+    const [result] = await sequelize.query(sql, { replacements, transaction: tx });
+    const r = result as { affectedRows?: number } | number;
+    return typeof r === 'number' ? r : num(r?.affectedRows);
+  };
+  const lock = (mode: 'update' | 'share') => (tx ? (mode === 'update' ? ' FOR UPDATE' : ' LOCK IN SHARE MODE') : '');
 
-        async findByMessage(messageId: string){
-            const rows = await ParticipantMessageModel.findAll({
-                where: { message_id: messageId },
-                order: [['status_at', 'ASC']],
-                transaction: tx,
-            });
-            return rows.map(toParticipantMessage);
-        },
+  const conversations: ConversationRepository = {
+    async findById(organizationId, id) {
+      const [r] = await select('SELECT * FROM conversations WHERE id = :id AND organization_id = :organizationId', { id, organizationId });
+      return r ? toConversation(r) : null;
+    },
+    async findByIdForUpdate(organizationId, id) {
+      const [r] = await select(`SELECT * FROM conversations WHERE id = :id AND organization_id = :organizationId${lock('update')}`, { id, organizationId });
+      return r ? toConversation(r) : null;
+    },
+    async findGeneral(organizationId) {
+      const [r] = await select(`SELECT * FROM conversations WHERE organization_id = :organizationId AND is_general = 1 LIMIT 1${lock('share')}`, { organizationId });
+      return r ? toConversation(r) : null;
+    },
+    async findByNameKey(organizationId, nameKey) {
+      const [r] = await select('SELECT * FROM conversations WHERE organization_id = :organizationId AND name_key = :nameKey', { organizationId, nameKey });
+      return r ? toConversation(r) : null;
+    },
+    async findByDmKey(organizationId, dmKey) {
+      const [r] = await select(`SELECT * FROM conversations WHERE organization_id = :organizationId AND dm_key = :dmKey${lock('share')}`, { organizationId, dmKey });
+      return r ? toConversation(r) : null;
+    },
+    async insertIfAbsent(c) {
+      const affected = await write(
+        `INSERT IGNORE INTO conversations (id, organization_id, kind, visibility, name, name_key, topic, description, is_general, dm_key,
+           created_by, archived_at, message_seq, last_message_at, created_at, updated_at)
+         VALUES (:id, :organizationId, :kind, :visibility, :name, :nameKey, :topic, :description, :isGeneral, :dmKey,
+           :createdBy, :archivedAt, :messageSeq, :lastMessageAt, :createdAt, :updatedAt)`,
+        { ...c, isGeneral: c.isGeneral ? 1 : 0 },
+      );
+      return affected > 0;
+    },
+    async update(c) {
+      await write(
+        `UPDATE conversations SET name = :name, name_key = :nameKey, topic = :topic, description = :description, archived_at = :archivedAt,
+           message_seq = :messageSeq, last_message_at = :lastMessageAt, updated_at = :updatedAt
+         WHERE id = :id AND organization_id = :organizationId`,
+        c as unknown as Record<string, unknown>,
+      );
+    },
+    async listForMember(organizationId, userId, includeArchived) {
+      const rows = await select(
+        `SELECT c.*, m.conversation_id AS m_conversation_id, m.user_id AS m_user_id, m.organization_id AS m_organization_id, m.role AS m_role,
+                m.notify AS m_notify, m.muted AS m_muted, m.last_read_seq AS m_last_read_seq, m.joined_at AS m_joined_at
+           FROM conversation_members m JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.organization_id = :organizationId AND m.user_id = :userId ${includeArchived ? '' : 'AND c.archived_at IS NULL'}`,
+        { organizationId, userId },
+      );
+      return rows.map((r) => ({ conversation: toConversation(r), me: toMember(r, 'm_') }));
+    },
+    async browseChannels(organizationId, userId, q, includeArchived) {
+      const rows = await select(
+        `SELECT c.*, (SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id = c.id) AS member_count,
+                EXISTS (SELECT 1 FROM conversation_members y WHERE y.conversation_id = c.id AND y.user_id = :userId) AS is_member
+           FROM conversations c
+          WHERE c.organization_id = :organizationId AND c.kind = 'channel'
+            AND (c.visibility = 'public' OR EXISTS (SELECT 1 FROM conversation_members z WHERE z.conversation_id = c.id AND z.user_id = :userId))
+            ${includeArchived ? '' : 'AND c.archived_at IS NULL'}
+            ${q ? 'AND (c.name LIKE :q OR c.topic LIKE :q)' : ''}
+          ORDER BY c.name LIMIT 500`,
+        // `%` y `_` que escriba la persona son literales, no comodines.
+        { organizationId, userId, q: q ? `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%` : null },
+      );
+      return rows.map((r): ChannelListing => ({ conversation: toConversation(r), memberCount: num(r.member_count), isMember: Boolean(num(r.is_member)) }));
+    },
+  };
 
-        async findByMessageAndUser(messageId: string, userId: string){
-            const m = await ParticipantMessageModel.findOne({
-                where: { message_id: messageId, participant_user_id: userId },
-                transaction: tx,
-            });
-            return m ? toParticipantMessage(m) : null;
-        },
+  const members: MemberRepository = {
+    async find(conversationId, userId) {
+      const [r] = await select('SELECT * FROM conversation_members WHERE conversation_id = :conversationId AND user_id = :userId', { conversationId, userId });
+      return r ? toMember(r) : null;
+    },
+    async insertIfAbsent(m) {
+      const affected = await write(
+        `INSERT IGNORE INTO conversation_members (conversation_id, user_id, organization_id, role, notify, muted, last_read_seq, joined_at)
+         VALUES (:conversationId, :userId, :organizationId, :role, :notify, :muted, :lastReadSeq, :joinedAt)`,
+        { ...m, muted: m.muted ? 1 : 0 },
+      );
+      return affected > 0;
+    },
+    async remove(conversationId, userId) {
+      return (await write('DELETE FROM conversation_members WHERE conversation_id = :conversationId AND user_id = :userId', { conversationId, userId })) > 0;
+    },
+    async list(conversationId) {
+      const rows = await select('SELECT * FROM conversation_members WHERE conversation_id = :conversationId ORDER BY joined_at, user_id', { conversationId });
+      return rows.map((r) => toMember(r));
+    },
+    async userIdsByConversation(conversationIds) {
+      const out = new Map<string, string[]>();
+      if (!conversationIds.length) return out;
+      const rows = await select('SELECT conversation_id, user_id FROM conversation_members WHERE conversation_id IN (:conversationIds)', { conversationIds });
+      for (const r of rows) out.set(String(r.conversation_id), [...(out.get(String(r.conversation_id)) ?? []), String(r.user_id)]);
+      return out;
+    },
+    async count(conversationId) {
+      const [r] = await select('SELECT COUNT(*) AS n FROM conversation_members WHERE conversation_id = :conversationId', { conversationId });
+      return num(r?.n);
+    },
+    async advanceRead(conversationId, userId, seq) {
+      await write(
+        'UPDATE conversation_members SET last_read_seq = GREATEST(last_read_seq, :seq) WHERE conversation_id = :conversationId AND user_id = :userId',
+        { conversationId, userId, seq },
+      );
+      const [r] = await select('SELECT last_read_seq FROM conversation_members WHERE conversation_id = :conversationId AND user_id = :userId', { conversationId, userId });
+      return num(r?.last_read_seq);
+    },
+    async updatePreferences(conversationId, userId, prefs) {
+      const sets: string[] = [];
+      if (prefs.notify) sets.push('notify = :notify');
+      if (prefs.muted !== undefined) sets.push('muted = :muted');
+      if (!sets.length) return;
+      await write(`UPDATE conversation_members SET ${sets.join(', ')} WHERE conversation_id = :conversationId AND user_id = :userId`, {
+        conversationId,
+        userId,
+        notify: prefs.notify ?? null,
+        muted: prefs.muted ? 1 : 0,
+      });
+    },
+    async channelIdsOf(organizationId, userId) {
+      const rows = await select(
+        `SELECT m.conversation_id FROM conversation_members m JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.organization_id = :organizationId AND m.user_id = :userId AND c.kind = 'channel'`,
+        { organizationId, userId },
+      );
+      return rows.map((r) => String(r.conversation_id));
+    },
+  };
 
-        async upsertStatus(messageId: string, userId: string, status: 'delivered' | 'read', at: Date){
-            await ParticipantMessageModel.upsert(
-                {
-                 message_id: messageId,
-                    participant_user_id: userId,
-                    status,
-                    status_at: at,
-                },
-                { transaction: tx }
-            );
+  const messages: MessageRepository = {
+    async insertIfAbsent(m) {
+      const affected = await write(
+        `INSERT IGNORE INTO messages (id, organization_id, conversation_id, seq, thread_root_id, thread_seq, sender_id, kind, body_doc, body_text,
+           client_msg_id, reply_count, last_reply_at, reply_user_ids, edited_at, deleted_at, deleted_by, created_at)
+         VALUES (:id, :organizationId, :conversationId, :seq, :threadRootId, :threadSeq, :senderId, :kind, :bodyDoc, :bodyText,
+           :clientMsgId, :replyCount, :lastReplyAt, :replyUserIds, :editedAt, :deletedAt, :deletedBy, :createdAt)`,
+        {
+          ...m,
+          bodyDoc: m.bodyDoc === null ? null : JSON.stringify(m.bodyDoc),
+          replyUserIds: JSON.stringify(m.replyUserIds),
         },
-    }
+      );
+      return affected > 0;
+    },
+    async findByClientMsgId(conversationId, clientMsgId) {
+      const [r] = await select('SELECT * FROM messages WHERE conversation_id = :conversationId AND client_msg_id = :clientMsgId', { conversationId, clientMsgId });
+      return r ? toMessage(r) : null;
+    },
+    async findById(organizationId, id) {
+      const [r] = await select('SELECT * FROM messages WHERE id = :id AND organization_id = :organizationId', { id, organizationId });
+      return r ? toMessage(r) : null;
+    },
+    async findByIdForUpdate(organizationId, id) {
+      const [r] = await select(`SELECT * FROM messages WHERE id = :id AND organization_id = :organizationId${lock('update')}`, { id, organizationId });
+      return r ? toMessage(r) : null;
+    },
+    async update(m) {
+      await write(
+        `UPDATE messages SET body_doc = :bodyDoc, body_text = :bodyText, reply_count = :replyCount, last_reply_at = :lastReplyAt,
+           reply_user_ids = :replyUserIds, edited_at = :editedAt, deleted_at = :deletedAt, deleted_by = :deletedBy
+         WHERE id = :id AND organization_id = :organizationId`,
+        { ...m, bodyDoc: m.bodyDoc === null ? null : JSON.stringify(m.bodyDoc), replyUserIds: JSON.stringify(m.replyUserIds) },
+      );
+    },
+    async latestReplies(threadRootId, n) {
+      const rows = await select('SELECT * FROM messages WHERE thread_root_id = :threadRootId ORDER BY thread_seq DESC LIMIT :n', { threadRootId, n });
+      return rows.map(toMessage).reverse();
+    },
+    async listReplies(threadRootId, q) {
+      const rows = await select(
+        `SELECT * FROM messages WHERE thread_root_id = :threadRootId ${q.after !== undefined ? 'AND thread_seq > :after' : ''} ORDER BY thread_seq ASC LIMIT :limit`,
+        { threadRootId, after: q.after ?? null, limit: q.limit },
+      );
+      return rows.map(toMessage);
+    },
+    async listRoots(conversationId, q: MessagePageQuery) {
+      const where = ['conversation_id = :conversationId', 'seq IS NOT NULL'];
+      if (q.before !== undefined) where.push('seq < :before');
+      if (q.after !== undefined) where.push('seq > :after');
+      // Con `after` se leen los siguientes en orden; si no, los últimos (desc) y se dan vuelta.
+      const asc = q.after !== undefined && q.before === undefined;
+      const rows = await select(`SELECT * FROM messages WHERE ${where.join(' AND ')} ORDER BY seq ${asc ? 'ASC' : 'DESC'} LIMIT :limit`, {
+        conversationId,
+        before: q.before ?? null,
+        after: q.after ?? null,
+        limit: q.limit,
+      });
+      const list = rows.map(toMessage);
+      return asc ? list : list.reverse();
+    },
+    async hasRootBefore(conversationId, seq) {
+      const rows = await select('SELECT 1 FROM messages WHERE conversation_id = :conversationId AND seq IS NOT NULL AND seq < :seq LIMIT 1', { conversationId, seq });
+      return rows.length > 0;
+    },
+    async hasRootAfter(conversationId, seq) {
+      const rows = await select('SELECT 1 FROM messages WHERE conversation_id = :conversationId AND seq > :seq LIMIT 1', { conversationId, seq });
+      return rows.length > 0;
+    },
+    async unreadCounts(userId, cursors) {
+      const out = new Map<string, UnreadCounts>();
+      if (!cursors.length) return out;
+      // Una consulta por tipo de contador, con el cursor de cada conversación en una tabla derivada (sin N consultas).
+      const pairs = cursors.map((_c, i) => `SELECT :c${i} AS conversation_id, :s${i} AS last_read_seq`).join(' UNION ALL ');
+      const repl: Record<string, unknown> = { userId };
+      cursors.forEach((c, i) => {
+        repl[`c${i}`] = c.conversationId;
+        repl[`s${i}`] = c.lastReadSeq;
+      });
+      const unread = await select(
+        `SELECT m.conversation_id, COUNT(*) AS n FROM messages m JOIN (${pairs}) k ON k.conversation_id = m.conversation_id
+          WHERE m.seq > k.last_read_seq AND m.kind = 'user' AND m.deleted_at IS NULL AND (m.sender_id IS NULL OR m.sender_id <> :userId)
+          GROUP BY m.conversation_id`,
+        repl,
+      );
+      const mentions = await select(
+        `SELECT m.conversation_id, COUNT(*) AS n FROM message_mentions mm JOIN messages m ON m.id = mm.message_id
+           JOIN (${pairs}) k ON k.conversation_id = m.conversation_id
+          WHERE mm.user_id = :userId AND m.seq > k.last_read_seq AND m.deleted_at IS NULL
+          GROUP BY m.conversation_id`,
+        repl,
+      );
+      for (const r of unread) out.set(String(r.conversation_id), { unread: num(r.n), mentions: 0 });
+      for (const r of mentions) out.set(String(r.conversation_id), { unread: out.get(String(r.conversation_id))?.unread ?? 0, mentions: num(r.n) });
+      return out;
+    },
+    async search(q) {
+      const where = [
+        'm.organization_id = :organizationId',
+        'm.deleted_at IS NULL',
+        "m.kind = 'user'",
+        // Legible: canal público o conversación de la que es miembro (canRead). Un DM o un privado ajeno nunca, ni para chat:admin.
+        "((c.kind = 'channel' AND c.visibility = 'public') OR EXISTS (SELECT 1 FROM conversation_members x WHERE x.conversation_id = c.id AND x.user_id = :userId))",
+      ];
+      const repl: Record<string, unknown> = { organizationId: q.organizationId, userId: q.userId, limit: q.limit };
+      if (q.booleanQuery) {
+        where.push('MATCH(m.body_text) AGAINST(:booleanQuery IN BOOLEAN MODE)');
+        repl.booleanQuery = q.booleanQuery;
+      }
+      q.likeTerms.forEach((t, i) => {
+        where.push(`m.body_text LIKE :like${i}`);
+        // `%` y `_` escritos por la persona son literales, no comodines.
+        repl[`like${i}`] = `%${t.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+      });
+      if (q.conversationId) {
+        where.push('m.conversation_id = :conversationId');
+        repl.conversationId = q.conversationId;
+      }
+      if (q.fromUserId) {
+        where.push('m.sender_id = :fromUserId');
+        repl.fromUserId = q.fromUserId;
+      }
+      if (q.before) {
+        where.push('(m.created_at < :beforeAt OR (m.created_at = :beforeAt AND m.id < :beforeId))');
+        repl.beforeAt = q.before.createdAt;
+        repl.beforeId = q.before.id;
+      }
+      const rows = await select(
+        `SELECT m.* FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE ${where.join(' AND ')} ORDER BY m.created_at DESC, m.id DESC LIMIT :limit`,
+        repl,
+      );
+      return rows.map(toMessage);
+    },
+    async latestRoots(conversationIds) {
+      const out = new Map<string, Message>();
+      if (!conversationIds.length) return out;
+      const rows = await select(
+        `SELECT m.* FROM messages m JOIN conversations c ON c.id = m.conversation_id AND m.seq = c.message_seq
+          WHERE m.conversation_id IN (:conversationIds)`,
+        { conversationIds },
+      );
+      for (const r of rows) out.set(String(r.conversation_id), toMessage(r));
+      return out;
+    },
+  };
+
+  const mentions: MentionRepository = {
+    async insertMany(list) {
+      for (const m of list) {
+        await write(
+          `INSERT IGNORE INTO message_mentions (message_id, user_id, organization_id, conversation_id, kind)
+           VALUES (:messageId, :userId, :organizationId, :conversationId, :kind)`,
+          m as unknown as Record<string, unknown>,
+        );
+      }
+    },
+  };
+
+  const reactions: ReactionRepository = {
+    async add(r) {
+      return (
+        (await write(
+          'INSERT IGNORE INTO message_reactions (message_id, user_id, emoji, organization_id, created_at) VALUES (:messageId, :userId, :emoji, :organizationId, :at)',
+          r as unknown as Record<string, unknown>,
+        )) > 0
+      );
+    },
+    async remove(messageId, userId, emoji) {
+      return (await write('DELETE FROM message_reactions WHERE message_id = :messageId AND user_id = :userId AND emoji = :emoji', { messageId, userId, emoji })) > 0;
+    },
+    async groupsFor(messageIds) {
+      const out = new Map<string, ReactionGroup[]>();
+      if (!messageIds.length) return out;
+      const rows = await select(
+        'SELECT message_id, emoji, user_id FROM message_reactions WHERE message_id IN (:messageIds) ORDER BY created_at, user_id',
+        { messageIds },
+      );
+      for (const r of rows) {
+        const id = String(r.message_id);
+        const groups = out.get(id) ?? [];
+        const g = groups.find((x) => x.emoji === r.emoji);
+        if (g) g.userIds.push(String(r.user_id));
+        else groups.push({ emoji: String(r.emoji), userIds: [String(r.user_id)] });
+        out.set(id, groups);
+      }
+      return out;
+    },
+  };
+
+  const threadFollowers: ThreadFollowerRepository = {
+    async add(threadRootId, userIds, organizationId) {
+      for (const userId of new Set(userIds)) {
+        await write('INSERT IGNORE INTO thread_followers (thread_root_id, user_id, organization_id) VALUES (:threadRootId, :userId, :organizationId)', {
+          threadRootId,
+          userId,
+          organizationId,
+        });
+      }
+    },
+    async list(threadRootId) {
+      return (await select('SELECT user_id FROM thread_followers WHERE thread_root_id = :threadRootId', { threadRootId })).map((r) => String(r.user_id));
+    },
+    async markRead(threadRootId, userId, threadSeq) {
+      // GREATEST: un aviso viejo no hace retroceder el cursor. LEAST con la última respuesta: no se puede «leer» lo que no existe.
+      await write(
+        `UPDATE thread_followers SET last_read_thread_seq = GREATEST(last_read_thread_seq,
+            LEAST(:threadSeq, (SELECT COALESCE(MAX(m.thread_seq), 0) FROM messages m WHERE m.thread_root_id = :threadRootId)))
+          WHERE thread_root_id = :threadRootId AND user_id = :userId`,
+        { threadRootId, userId, threadSeq },
+      );
+      const [r] = await select('SELECT last_read_thread_seq FROM thread_followers WHERE thread_root_id = :threadRootId AND user_id = :userId', { threadRootId, userId });
+      return r ? num(r.last_read_thread_seq) : null;
+    },
+    async listForUser(q) {
+      const where = ['f.user_id = :userId', 'f.organization_id = :organizationId', 'm.reply_count > 0', 'm.last_reply_at IS NOT NULL', READABLE];
+      if (q.before) where.push('(m.last_reply_at < :beforeAt OR (m.last_reply_at = :beforeAt AND m.id < :beforeId))');
+      const rows = await select(
+        `SELECT m.*, f.last_read_thread_seq AS f_cursor FROM thread_followers f
+           JOIN messages m ON m.id = f.thread_root_id JOIN conversations c ON c.id = m.conversation_id
+          WHERE ${where.join(' AND ')} ORDER BY m.last_reply_at DESC, m.id DESC LIMIT :limit`,
+        { userId: q.userId, organizationId: q.organizationId, beforeAt: q.before?.lastReplyAt ?? null, beforeId: q.before?.id ?? null, limit: q.limit },
+      );
+      return rows.map((r) => ({ root: toMessage(r), lastReadThreadSeq: num(r.f_cursor) }));
+    },
+    async counts(userId, items) {
+      const out = new Map<string, UnreadCounts>();
+      if (!items.length) return out;
+      // Igual que `unreadCounts`: los cursores en una tabla derivada, una consulta por contador (sin N consultas).
+      const pairs = items.map((_x, i) => `SELECT :r${i} AS root_id, :s${i} AS cursor_seq`).join(' UNION ALL ');
+      const repl: Record<string, unknown> = { userId };
+      items.forEach((x, i) => {
+        repl[`r${i}`] = x.threadRootId;
+        repl[`s${i}`] = x.lastReadThreadSeq;
+      });
+      const unread = await select(
+        `SELECT r.thread_root_id, COUNT(*) AS n FROM messages r JOIN (${pairs}) k ON k.root_id = r.thread_root_id
+          WHERE r.thread_seq > k.cursor_seq AND r.kind = 'user' AND r.deleted_at IS NULL AND (r.sender_id IS NULL OR r.sender_id <> :userId)
+          GROUP BY r.thread_root_id`,
+        repl,
+      );
+      const mentions = await select(
+        `SELECT r.thread_root_id, COUNT(*) AS n FROM message_mentions mm JOIN messages r ON r.id = mm.message_id JOIN (${pairs}) k ON k.root_id = r.thread_root_id
+          WHERE mm.user_id = :userId AND r.thread_seq > k.cursor_seq AND r.deleted_at IS NULL
+          GROUP BY r.thread_root_id`,
+        repl,
+      );
+      for (const r of unread) out.set(String(r.thread_root_id), { unread: num(r.n), mentions: 0 });
+      for (const r of mentions) out.set(String(r.thread_root_id), { unread: out.get(String(r.thread_root_id))?.unread ?? 0, mentions: num(r.n) });
+      return out;
+    },
+    async totals(organizationId, userId) {
+      const base = `FROM thread_followers f JOIN messages m ON m.id = f.thread_root_id JOIN conversations c ON c.id = m.conversation_id
+        JOIN messages r ON r.thread_root_id = f.thread_root_id AND r.thread_seq > f.last_read_thread_seq AND r.deleted_at IS NULL`;
+      const [threads] = await select(
+        `SELECT COUNT(DISTINCT f.thread_root_id) AS n ${base}
+          WHERE f.user_id = :userId AND f.organization_id = :organizationId AND ${READABLE}
+            AND r.kind = 'user' AND (r.sender_id IS NULL OR r.sender_id <> :userId)
+            AND NOT EXISTS (SELECT 1 FROM conversation_members s WHERE s.conversation_id = c.id AND s.user_id = :userId AND s.muted = 1)`,
+        { organizationId, userId },
+      );
+      const [mentions] = await select(
+        `SELECT COUNT(*) AS n ${base} JOIN message_mentions mm ON mm.message_id = r.id AND mm.user_id = :userId
+          WHERE f.user_id = :userId AND f.organization_id = :organizationId AND ${READABLE}`,
+        { organizationId, userId },
+      );
+      return { threads: num(threads?.n), mentions: num(mentions?.n) };
+    },
+  };
+
+  const inactiveUsers: InactiveUserRepository = {
+    async mark(organizationId, userId, since) {
+      await write('INSERT IGNORE INTO inactive_users (organization_id, user_id, since) VALUES (:organizationId, :userId, :since)', { organizationId, userId, since });
+    },
+    async clear(organizationId, userId) {
+      await write('DELETE FROM inactive_users WHERE organization_id = :organizationId AND user_id = :userId', { organizationId, userId });
+    },
+    async inactiveAmong(organizationId, userIds) {
+      if (!userIds.length) return new Set();
+      const rows = await select('SELECT user_id FROM inactive_users WHERE organization_id = :organizationId AND user_id IN (:userIds)', { organizationId, userIds });
+      return new Set(rows.map((r) => String(r.user_id)));
+    },
+  };
+
+  const outbox: OutboxRepository = {
+    async add(event: DomainEvent) {
+      await write(
+        `INSERT INTO outbox_messages (id, aggregate_type, aggregate_id, type, payload, occurred_at, processed_at)
+         VALUES (:id, :aggregateType, :aggregateId, :type, :payload, :occurredAt, NULL)`,
+        {
+          id: event.eventId,
+          aggregateType: event.aggregateType,
+          aggregateId: event.aggregateId,
+          type: event.type,
+          // Actor, IP y request-id viajan en el contexto de la petición (runWithActor del middleware).
+          payload: JSON.stringify(withActor(event.payload)),
+          occurredAt: event.occurredAt,
+        },
+      );
+    },
+  };
+
+  const toEmoji = (r: Row): CustomEmoji => ({
+    id: String(r.id),
+    organizationId: String(r.organization_id),
+    name: String(r.name),
+    documentId: String(r.document_id),
+    createdBy: String(r.created_by),
+    createdAt: new Date(r.created_at as string),
+  });
+  const emojis: EmojiRepository = {
+    async list(organizationId) {
+      return (await select('SELECT * FROM custom_emojis WHERE organization_id = :organizationId ORDER BY name', { organizationId })).map(toEmoji);
+    },
+    async findByName(organizationId, name) {
+      const [r] = await select('SELECT * FROM custom_emojis WHERE organization_id = :organizationId AND name = :name', { organizationId, name });
+      return r ? toEmoji(r) : null;
+    },
+    async findById(organizationId, id) {
+      const [r] = await select('SELECT * FROM custom_emojis WHERE organization_id = :organizationId AND id = :id', { organizationId, id });
+      return r ? toEmoji(r) : null;
+    },
+    async insertIfAbsent(e) {
+      const affected = await write(
+        'INSERT IGNORE INTO custom_emojis (id, organization_id, name, document_id, created_by, created_at) VALUES (:id, :organizationId, :name, :documentId, :createdBy, :createdAt)',
+        { ...e },
+      );
+      return affected > 0;
+    },
+    async remove(organizationId, id) {
+      return (await write('DELETE FROM custom_emojis WHERE organization_id = :organizationId AND id = :id', { organizationId, id })) > 0;
+    },
+  };
+
+  return { conversations, members, messages, mentions, reactions, threadFollowers, inactiveUsers, emojis, outbox };
 }
 
-function messageVersionRepository(tx?: Transaction): MessageVersionRepository {
-    return {
-        async save(version: MessageVersion){
-            const p = version.toPersistence();
-            await MessageVersionModel.create(
-                {
-                    id: p.id,
-                    message_id: p.messageId,
-                    content: p.content,
-                    edited_by: p.editedBy,
-                    edited_at: p.editedAt,
-                },
-                { transaction: tx }
-            );
-        },
+/** Lecturas fuera de transacción. */
+export const readOnlyRepositories: Repositories = buildRepositories();
 
-        async findByMessage(messageId: string){
-            const rows = await MessageVersionModel.findAll({
-                where: { message_id: messageId },
-                order: [['edited_at', 'ASC']],
-                transaction: tx,
-            });
-            return rows.map(toMessageVersion);
-        },
-    }
+class SequelizeUnitOfWork implements WriteUnitOfWork {
+  readonly conversations;
+  readonly members;
+  readonly messages;
+  readonly mentions;
+  readonly reactions;
+  readonly threadFollowers;
+  readonly inactiveUsers;
+  readonly emojis;
+  readonly outbox;
+
+  constructor(private readonly tx: Transaction) {
+    const repos = buildRepositories(tx);
+    this.conversations = repos.conversations;
+    this.members = repos.members;
+    this.messages = repos.messages;
+    this.mentions = repos.mentions;
+    this.reactions = repos.reactions;
+    this.threadFollowers = repos.threadFollowers;
+    this.inactiveUsers = repos.inactiveUsers;
+    this.emojis = repos.emojis;
+    this.outbox = repos.outbox;
+  }
+
+  async commit(): Promise<void> {
+    await this.tx.commit();
+  }
+
+  async rollback(): Promise<void> {
+    // Tras un deadlock MySQL ya deshizo la transacción y Sequelize la da por terminada: un segundo rollback taparía el error real.
+    if ((this.tx as unknown as { finished?: string }).finished) return;
+    await this.tx.rollback();
+  }
 }
 
-function messageDeletionRepository(tx?: Transaction): MessageDeletionRepository {
-    return {
-        async save(deletion: MessageDeletion){
-            const p = deletion.toPersistence();
-            await MessageDeletionModel.create(
-                {
-                    id: p.id,
-                    message_id: p.messageId,
-                    deleted_by: p.deletedBy,
-                    deleted_at: p.deletedAt,
-                },
-                { transaction: tx }
-            );
-        },
+export class SequelizeUnitOfWorkFactory implements UnitOfWorkGateway {
+  constructor(private readonly onBegin?: (tx: Transaction) => void) {}
 
-        async exists(messageId: string, userId: string){
-            const count = await MessageDeletionModel.count({
-                where: { message_id: messageId, deleted_by: userId },
-                transaction: tx,
-            });
-            return count > 0;
-        },
+  isRetryable(err: unknown): boolean {
+    const e = err as { parent?: { code?: string; errno?: number }; original?: { code?: string; errno?: number } };
+    const cause = e?.parent ?? e?.original;
+    return cause?.code === 'ER_LOCK_DEADLOCK' || cause?.errno === 1213;
+  }
 
-        async findByMessage(messageId: string){
-            const rows = await MessageDeletionModel.findAll({
-                where: { message_id: messageId },
-                transaction: tx,
-            });
-            return rows.map(toMessageDeletion);
-        },
-
-        async findByConversationAndUser(conversationId: string, userId: string){
-            const rows = await MessageDeletionModel.findAll({
-                include: [{model: MessageModel, as: 'message', where: { conversation_id: conversationId }}],
-                where: { deleted_by: userId },
-                transaction: tx,
-            });
-            return rows.map(toMessageDeletion);
-        },
-    }
-}
-
-function outboxRepository(tx?: Transaction): OutboxRepository {
-    return {
-        async add(event: DomainEvent){
-            await OutboxModel.create(
-                {
-                    id: event.eventId,
-                    aggregate_type: event.aggregateType,
-                    aggregate_id: event.aggregateId,
-                    type: event.type,
-                    payload: withActor(event.payload as Record<string, unknown>),
-                    occurred_at: event.occurredAt,
-                    processed_at: null,
-                },
-                { transaction: tx }
-            );
-        },
-    }
-}
-
-function  processedEventRepository(tx?: Transaction): ProcessedEventRepository {
-    return {
-        async exists(eventId: string){
-            const row = await ProcessedEventModel.findByPk(eventId, { transaction: tx });
-            return row !== null;
-        },
-
-        async save(eventId: string){
-            await ProcessedEventModel.create(
-                { event_id: eventId, processed_at: new Date() },
-                { transaction: tx }
-            );
-        },
-    }
-}
-
-export function buildRepositories(tx: Transaction | undefined): Repositories {
-    return {
-        conversations: conversationRepository(tx),
-        participants: participantRepository(tx),
-        messages: messageRepository(tx),
-        participantMessages: participantMessageRepository(tx),
-        messageVersions: messageVersionRepository(tx),
-        messageDeletions: messageDeletionRepository(tx),
-        outbox: outboxRepository(tx),
-        processedEvents: processedEventRepository(tx),
-    };
-}
-
-export class SequelizeUnitOfWork  implements UnitOfWork {
-    async execute<T>(work: (repos: Repositories) => Promise<T>): Promise<T> {
-        return sequelize.transaction(async (tx) =>  work(buildRepositories(tx)));
-    }
+  async begin(): Promise<WriteUnitOfWork> {
+    const tx = await sequelize.transaction();
+    // El relay publica el outbox justo tras el commit; sin este enganche los eventos esperan el barrido de respaldo.
+    this.onBegin?.(tx);
+    return new SequelizeUnitOfWork(tx);
+  }
 }

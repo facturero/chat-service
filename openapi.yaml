@@ -1,0 +1,696 @@
+openapi: 3.0.3
+info:
+  title: chat-service
+  version: 2.0.0
+  description: >
+    Mensajería al estilo Slack para el equipo de una organización: canales públicos y privados, mensajes directos 1-a-1 y de grupo,
+    hilos, reacciones, edición y borrado, archivos y tarjetas del CRM. Diseño y reglas en `IMPLEMENTATION.md`.
+
+    Todas las rutas pasan por el gateway (`ANY /chat/*`, módulo `comm.internal_chat`, sin permiso: cualquier miembro activo), que
+    inyecta `X-Organization-Id`, `X-User-Id` y `X-Permissions` (`chat:admin` da gestión de canales y borrar mensajes ajenos, pero NO
+    abre DMs ni canales privados ajenos). Una conversación que el usuario no puede leer responde 404, nunca 403.
+
+    El tiempo real no está aquí: el hub de Socket.IO del gateway reenvía los eventos de `asyncapi.yaml` (ver `docs/tiempo-real.md`).
+    Enviar, editar, borrar, reaccionar y marcar leído van SIEMPRE por estas rutas.
+
+    Orden: los mensajes raíz llevan `seq` (1, 2, 3… por conversación) y las respuestas de hilo `threadSeq` dentro de su raíz. La
+    paginación usa esos números, nunca fechas.
+servers:
+  - url: http://localhost:3007
+paths:
+  /health:
+    get:
+      summary: Salud del servicio
+      security: []
+      responses:
+        '200': { description: OK }
+
+  # ── Conversaciones ────────────────────────────────────────────────────────
+
+  /chat/conversations:
+    get:
+      summary: Barra lateral — las conversaciones de las que soy miembro, con no leídos y menciones
+      description: >
+        Canales (públicos y privados) y DMs donde soy miembro, sin los archivados salvo `includeArchived`. La primera vez que alguien
+        de la organización llama, se crea `#general` con todo el equipo activo.
+      parameters:
+        - { in: query, name: includeArchived, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Ordenadas por último mensaje
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ConversationSummary' } }
+    post:
+      summary: Crear un canal o abrir un DM
+      description: >
+        Canal: `kind = channel`, nombre único en la organización (sin distinguir mayúsculas ni tildes), quien lo crea queda como dueño.
+        DM: `kind = dm` con 1 persona o `group_dm` con 2 a 8; es idempotente: si ya existe la conversación con exactamente esas personas,
+        la devuelve con 200 en vez de crear otra.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversation' }
+      responses:
+        '200': { description: El DM ya existía, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '201': { description: Creada, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/conversations/browse:
+    get:
+      summary: Explorar canales — los públicos de la organización (y los privados donde ya soy miembro)
+      parameters:
+        - { in: query, name: q, schema: { type: string, maxLength: 80 } }
+        - { in: query, name: includeArchived, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Ordenados por nombre
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ChannelListing' } }
+
+  /chat/conversations/{conversationId}:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    get:
+      summary: Detalle de una conversación (un canal público se puede ver sin ser miembro)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Renombrar, cambiar tema o descripción (dueño o `chat:admin`; solo canales)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversation' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/conversations/{conversationId}/archive:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    post:
+      summary: Archivar un canal (queda de solo lectura; `#general` no se archiva)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /chat/conversations/{conversationId}/unarchive:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    post:
+      summary: Desarchivar un canal
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /chat/conversations/{conversationId}/join:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    post:
+      summary: Unirme a un canal público (idempotente)
+      responses:
+        '200': { description: Ya era miembro o se unió, content: { application/json: { schema: { $ref: '#/components/schemas/ConversationDetail' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /chat/conversations/{conversationId}/members:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    get:
+      summary: Miembros (ids, rol y desde cuándo; los nombres los pone el frontend con `/users/directory`)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Member' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      summary: Agregar personas a un canal (cualquier miembro; deben ser miembros activos de la organización)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userIds]
+              properties:
+                userIds: { type: array, minItems: 1, maxItems: 50, items: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Agregados (los que ya estaban se ignoran)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Member' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/conversations/{conversationId}/members/{userId}:
+    parameters:
+      - { $ref: '#/components/parameters/conversationId' }
+      - { $ref: '#/components/parameters/userId' }
+    delete:
+      summary: Salir (mi propio id) o quitar a alguien (dueño o `chat:admin`). Nadie sale de `#general` ni de un DM 1-a-1
+      responses:
+        '204': { description: Hecho }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /chat/conversations/{conversationId}/read:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    post:
+      summary: Marcar leído hasta un mensaje (solo avanza; uno más viejo se ignora)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seq]
+              properties:
+                seq: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Cursor resultante
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lastReadSeq: { type: integer }
+                  unreadCount: { type: integer }
+                  mentionCount: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /chat/conversations/{conversationId}/preferences:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    patch:
+      summary: Mis avisos en esta conversación
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notify: { type: string, enum: [all, mentions, none] }
+                muted: { type: boolean }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/MyMembership' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ── Mensajes ──────────────────────────────────────────────────────────────
+
+  /chat/conversations/{conversationId}/messages:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    get:
+      summary: Mensajes raíz de la conversación (las respuestas de hilo van aparte)
+      description: >
+        Sin parámetros: los últimos `limit`. `before`/`after`: por `seq` (scroll hacia atrás y ponerse al día tras reconectar).
+        `around`: un mensaje y su contexto (enlace permanente). Devuelve ascendente por `seq`.
+      parameters:
+        - { in: query, name: before, schema: { type: integer } }
+        - { in: query, name: after, schema: { type: integer } }
+        - { in: query, name: around, schema: { type: string, format: uuid } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/MessagePage' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      summary: Enviar un mensaje (o responder en un hilo con `threadRootId`)
+      description: >
+        Idempotente por `clientMsgId`: reenviar el mismo devuelve el mensaje ya creado (200). Escribir en un canal público sin ser
+        miembro une a la persona primero. Publica `chat.message.created`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessage' }
+      responses:
+        '200': { description: Ya existía (mismo clientMsgId), content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '201': { description: Enviado, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+        '429': { $ref: '#/components/responses/TooMany' }
+
+  /chat/messages/{messageId}:
+    parameters: [{ $ref: '#/components/parameters/messageId' }]
+    get:
+      summary: Un mensaje (para el enlace permanente y las tarjetas citadas)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Editar mi mensaje (sin historial; queda `editedAt`)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bodyDoc]
+              properties:
+                bodyDoc: { $ref: '#/components/schemas/RichDoc' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+    delete:
+      summary: Borrar para todos (autor; en canales también `chat:admin`). Se borra el texto, queda la lápida
+      responses:
+        '204': { description: Borrado }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /chat/messages/{messageId}/replies:
+    parameters: [{ $ref: '#/components/parameters/messageId' }]
+    get:
+      summary: Respuestas de un hilo (ascendente por `threadSeq`)
+      parameters:
+        - { in: query, name: after, schema: { type: integer } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  root: { $ref: '#/components/schemas/Message' }
+                  items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+                  hasMore: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /chat/messages/{messageId}/reactions:
+    parameters: [{ $ref: '#/components/parameters/messageId' }]
+    post:
+      summary: Reaccionar (idempotente)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReactionSummary' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/messages/{messageId}/reactions/{emoji}:
+    parameters:
+      - { $ref: '#/components/parameters/messageId' }
+      - { in: path, name: emoji, required: true, description: Codificado con encodeURIComponent, schema: { type: string } }
+    delete:
+      summary: Quitar mi reacción (idempotente)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReactionSummary' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Bandeja y búsqueda ────────────────────────────────────────────────────
+
+  /chat/unread:
+    get:
+      summary: Totales para la barra superior, el menú lateral y el widget de Inicio
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversations: { type: integer, description: Conversaciones con algo sin leer (sin las silenciadas) }
+                  mentions: { type: integer, description: Menciones y mensajes directos sin leer }
+                  threads:
+                    type: object
+                    description: 'Hilos que sigo. Las menciones en hilos no suman a `mentions` (el menú las suma aparte)'
+                    properties:
+                      unread: { type: integer, description: Hilos con respuestas nuevas (sin contar conversaciones silenciadas) }
+                      mentions: { type: integer, description: Menciones a mí en respuestas que no leí }
+                  latest:
+                    type: array
+                    maxItems: 10
+                    description: Últimos mensajes sin leer para la bandeja (uno por conversación)
+                    items: { $ref: '#/components/schemas/InboxItem' }
+
+  /chat/emojis:
+    get:
+      summary: 'Emojis personalizados de la organización (se usan como `:nombre:` en mensajes y reacciones)'
+      responses:
+        '200':
+          description: Por nombre
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/CustomEmoji' } }
+    post:
+      summary: 'Agregar un emoji (cualquiera del equipo). La imagen se sube antes a document-service con `resourceType: chat_emoji`'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, documentId]
+              properties:
+                name: { type: string, description: 'Se normaliza a minúsculas, 2–32 de a-z 0-9 _ + -' }
+                documentId: { type: string, format: uuid }
+      responses:
+        '201': { description: Creado, content: { application/json: { schema: { $ref: '#/components/schemas/CustomEmoji' } } } }
+        '409': { description: Ya existe un emoji con ese nombre }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/emojis/{emojiId}:
+    parameters:
+      - { in: path, name: emojiId, required: true, schema: { type: string, format: uuid } }
+    delete:
+      summary: 'Quitar un emoji: quien lo subió o `chat:admin`. Los mensajes que lo usan muestran `:nombre:`'
+      responses:
+        '204': { description: Quitado }
+        '403': { description: No lo subiste y no eres administrador del chat }
+        '404': { description: No existe }
+
+  /chat/threads:
+    get:
+      summary: 'Vista «Hilos»: los hilos que sigo (escribí la raíz, respondí o me mencionaron) y que aún puedo leer'
+      parameters:
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: El de respuesta más reciente primero
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ThreadItem' } }
+                  nextCursor: { type: string, nullable: true }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/messages/{messageId}/thread/read:
+    parameters: [{ $ref: '#/components/parameters/messageId' }]
+    post:
+      summary: Leí el hilo hasta esta respuesta (nunca retrocede ni pasa de la última). Sin seguir el hilo no cambia nada
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [threadSeq]
+              properties:
+                threadSeq: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: 'El cursor que quedó (null si no sigo el hilo) y lo que falta leer'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lastReadThreadSeq: { type: integer, nullable: true }
+                  unreadCount: { type: integer }
+                  mentionCount: { type: integer }
+        '404': { description: No existe, no es la raíz de un hilo o no puedo leerlo }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  /chat/search:
+    get:
+      summary: Buscar mensajes en lo que puedo leer (mis conversaciones y los canales públicos)
+      parameters:
+        - { in: query, name: q, required: true, schema: { type: string, minLength: 2, maxLength: 200 } }
+        - { in: query, name: conversationId, schema: { type: string, format: uuid } }
+        - { in: query, name: fromUserId, schema: { type: string, format: uuid } }
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Más recientes primero
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/SearchHit' } }
+                  nextCursor: { type: string, nullable: true }
+        '422': { $ref: '#/components/responses/Validation' }
+
+  # ── Interna (solo el hub del gateway, con X-Internal-Secret; no pasa por el gateway) ──
+
+  /internal/messages/{messageId}:
+    parameters: [{ $ref: '#/components/parameters/messageId' }]
+    get:
+      summary: Un mensaje completo para que el hub lo entregue por socket (los eventos no llevan texto)
+      security: [{ internalSecret: [] }]
+      parameters:
+        - { in: query, name: organizationId, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: 'OK (sin `reactions` ni `mentionsMe`, que dependen de quién mira)', content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } } }
+        '401': { description: Falta o no coincide el secreto }
+        '404': { description: No existe en esa organización }
+
+  /internal/conversations/{conversationId}/members:
+    parameters: [{ $ref: '#/components/parameters/conversationId' }]
+    get:
+      summary: Ids de los miembros (para «escribiendo…» en el hub)
+      security: [{ internalSecret: [] }]
+      parameters:
+        - { in: query, name: organizationId, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userIds: { type: array, items: { type: string, format: uuid } }
+        '401': { description: Falta o no coincide el secreto }
+        '404': { description: No existe en esa organización }
+
+components:
+  securitySchemes:
+    internalSecret: { type: apiKey, in: header, name: X-Internal-Secret }
+  parameters:
+    conversationId: { in: path, name: conversationId, required: true, schema: { type: string, format: uuid } }
+    messageId: { in: path, name: messageId, required: true, schema: { type: string, format: uuid } }
+    userId: { in: path, name: userId, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Forbidden: { description: Puede leer pero no hacer esto (no es el dueño, no es el autor…), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: No existe o no se puede leer, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: 'Canal archivado (`CONVERSATION_ARCHIVED`), nombre repetido (`NAME_TAKEN`), persona inactiva (`USER_INACTIVE`), salir de #general (`GENERAL_IS_MANDATORY`)…', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Validation: { description: Datos inválidos, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    TooMany: { description: Más de 30 mensajes por minuto, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Error:
+      type: object
+      required: [code, message, status]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        status: { type: integer }
+        details: { type: array, items: { type: object, properties: { field: { type: string }, message: { type: string } } } }
+    RichDoc:
+      type: object
+      description: >
+        Documento TipTap validado por lista blanca (la de projects-service más el nodo `crmLink`). Texto ≤ 4000 caracteres. Imágenes y
+        archivos con `documentId` (nunca la URL). Menciones: nodo `mention` con `attrs.id` = uuid de usuario, o `attrs.id` = `channel` /
+        `here` para @canal / @aquí.
+      additionalProperties: true
+    CrmLink:
+      type: object
+      description: Atributos del nodo `crmLink` (la tarjeta la completa el navegador con los permisos de quien la ve)
+      required: [entityType, entityId, label]
+      properties:
+        entityType: { type: string, enum: [customer, invoice, task, project, product] }
+        entityId: { type: string, format: uuid }
+        label: { type: string, maxLength: 200 }
+    CreateConversation:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [channel, dm, group_dm] }
+        name: { type: string, minLength: 1, maxLength: 80, description: Solo canales }
+        visibility: { type: string, enum: [public, private], description: Solo canales }
+        topic: { type: string, maxLength: 250 }
+        description: { type: string, maxLength: 1000 }
+        userIds:
+          type: array
+          maxItems: 50
+          items: { type: string, format: uuid }
+          description: 'Canal: miembros iniciales (opcional). DM: exactamente 1 (sin incluirme). Grupo: 2 a 8.'
+    UpdateConversation:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        topic: { type: string, maxLength: 250, nullable: true }
+        description: { type: string, maxLength: 1000, nullable: true }
+    MyMembership:
+      type: object
+      properties:
+        role: { type: string, enum: [owner, member] }
+        notify: { type: string, enum: [all, mentions, none] }
+        muted: { type: boolean }
+        lastReadSeq: { type: integer }
+        joinedAt: { type: string, format: date-time }
+    ConversationSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [channel, dm, group_dm] }
+        visibility: { type: string, enum: [public, private], nullable: true }
+        name: { type: string, nullable: true, description: Null en DMs (el frontend arma el nombre con los participantes) }
+        isGeneral: { type: boolean }
+        participantUserIds: { type: array, items: { type: string, format: uuid }, description: Solo DMs (sin mí) }
+        archivedAt: { type: string, format: date-time, nullable: true }
+        lastMessageAt: { type: string, format: date-time, nullable: true }
+        lastMessageSeq: { type: integer }
+        unreadCount: { type: integer, description: 'Raíz sin leer, sin los míos ni borrados (tope 99)' }
+        mentionCount: { type: integer }
+        me: { $ref: '#/components/schemas/MyMembership' }
+    ChannelListing:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        visibility: { type: string, enum: [public, private] }
+        topic: { type: string, nullable: true }
+        memberCount: { type: integer }
+        isMember: { type: boolean }
+        archivedAt: { type: string, format: date-time, nullable: true }
+    ConversationDetail:
+      allOf:
+        - $ref: '#/components/schemas/ConversationSummary'
+        - type: object
+          properties:
+            topic: { type: string, nullable: true }
+            description: { type: string, nullable: true }
+            createdBy: { type: string, format: uuid }
+            createdAt: { type: string, format: date-time }
+            memberCount: { type: integer }
+            isMember: { type: boolean }
+            me: { allOf: [{ $ref: '#/components/schemas/MyMembership' }], nullable: true, description: Null si veo un canal público sin ser miembro }
+    Member:
+      type: object
+      properties:
+        userId: { type: string, format: uuid }
+        role: { type: string, enum: [owner, member] }
+        joinedAt: { type: string, format: date-time }
+        inactive: { type: boolean }
+    SendMessage:
+      type: object
+      required: [clientMsgId, bodyDoc]
+      properties:
+        clientMsgId: { type: string, format: uuid, description: Lo genera el navegador; hace idempotente el reenvío }
+        bodyDoc: { $ref: '#/components/schemas/RichDoc' }
+        threadRootId: { type: string, format: uuid, nullable: true }
+    ReactionSummary:
+      type: object
+      properties:
+        emoji: { type: string }
+        count: { type: integer }
+        userIds: { type: array, items: { type: string, format: uuid } }
+        mine: { type: boolean }
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        seq: { type: integer, nullable: true, description: Mensaje raíz }
+        threadRootId: { type: string, format: uuid, nullable: true }
+        threadSeq: { type: integer, nullable: true, description: Respuesta de hilo }
+        senderId: { type: string, format: uuid, nullable: true, description: Null en mensajes de sistema }
+        kind: { type: string, enum: [user, system] }
+        bodyDoc: { allOf: [{ $ref: '#/components/schemas/RichDoc' }], nullable: true, description: Null si se borró }
+        bodyText: { type: string, nullable: true }
+        clientMsgId: { type: string, format: uuid, nullable: true }
+        replyCount: { type: integer }
+        lastReplyAt: { type: string, format: date-time, nullable: true }
+        replyUserIds: { type: array, maxItems: 3, items: { type: string, format: uuid } }
+        reactions: { type: array, items: { $ref: '#/components/schemas/ReactionSummary' } }
+        mentionsMe: { type: boolean }
+        editedAt: { type: string, format: date-time, nullable: true }
+        deletedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+    MessagePage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        hasOlder: { type: boolean }
+        hasNewer: { type: boolean }
+        lastReadSeq: { type: integer, nullable: true, description: Mi cursor (línea de «nuevos»); null si no soy miembro }
+    InboxItem:
+      type: object
+      properties:
+        conversationId: { type: string, format: uuid }
+        kind: { type: string, enum: [channel, dm, group_dm] }
+        name: { type: string, nullable: true }
+        unreadCount: { type: integer }
+        mentionCount: { type: integer }
+        lastMessage: { $ref: '#/components/schemas/Message' }
+    CustomEmoji:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        documentId: { type: string, format: uuid }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+    ThreadItem:
+      type: object
+      properties:
+        root: { $ref: '#/components/schemas/Message' }
+        conversation:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            kind: { type: string, enum: [channel, dm, group_dm] }
+            name: { type: string, nullable: true }
+        latestReplies: { type: array, maxItems: 2, items: { $ref: '#/components/schemas/Message' } }
+        lastReadThreadSeq: { type: integer }
+        unreadCount: { type: integer, description: Respuestas de otros sin leer }
+        mentionCount: { type: integer, description: Menciones a mí sin leer en este hilo }
+    SearchHit:
+      type: object
+      properties:
+        message: { $ref: '#/components/schemas/Message' }
+        conversation:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            kind: { type: string, enum: [channel, dm, group_dm] }
+            name: { type: string, nullable: true }
+        snippet: { type: string, description: Trozo del texto alrededor de la coincidencia }

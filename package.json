@@ -1,7 +1,7 @@
 {
   "name": "chat-service",
   "version": "1.0.0",
-  "description": "Servicio de chat en tiempo real para facturero (WebSocket + REST)",
+  "description": "Mensajería al estilo Slack del CRM: canales, mensajes directos, hilos y reacciones (REST; el tiempo real va por el hub del gateway)",
   "license": "UNLICENSED",
   "private": true,
   "main": "dist/main.js",
@@ -13,7 +13,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "sequelize-cli db:migrate",
-    "db:migrate:undo": "sequelize-cli db:migrate:undo"
+    "db:migrate:undo": "sequelize-cli db:migrate:undo",
+    "verify:openapi": "node scripts/check-openapi-routes.mjs",
+    "verify:asyncapi": "node scripts/check-asyncapi-events.mjs"
   },
   "dependencies": {
     "@facturero/outbox-relay": "^0.2.1",

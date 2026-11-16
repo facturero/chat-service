@@ -15,7 +15,9 @@ jobs:
       contents: read
       packages: write
     env:
-      NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+      # GITHUB_TOKEN y no el secreto NODE_AUTH_TOKEN (token personal): ese caducó el 2026-11-16 y rompió el `npm ci` con 401. El
+      # `docker build` de abajo ya baja @facturero/outbox-relay con GITHUB_TOKEN, así que el paquete ya da acceso a este repo.
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4

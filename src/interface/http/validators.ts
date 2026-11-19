@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { ValidationError } from '../../domain/errors.js';
 import { CONVERSATION_KINDS, NOTIFY_LEVELS, VISIBILITIES, type ConversationKind, type NotifyLevel, type Visibility } from '../../domain/types.js';
 
-const uuid = z.string().uuid();
+const uuid = z.string().guid();
 
 export const createConversationSchema = z.object({
   kind: z.enum(CONVERSATION_KINDS as [ConversationKind, ...ConversationKind[]]),
@@ -31,11 +31,11 @@ export const preferencesSchema = z
 export const sendMessageSchema = z.object({
   clientMsgId: uuid,
   // El documento lo valida el dominio (`richtext.ts`, lista blanca); aquí solo que sea un objeto.
-  bodyDoc: z.record(z.unknown()),
+  bodyDoc: z.record(z.string(), z.unknown()),
   threadRootId: uuid.nullable().optional(),
 });
 
-export const editMessageSchema = z.object({ bodyDoc: z.record(z.unknown()) });
+export const editMessageSchema = z.object({ bodyDoc: z.record(z.string(), z.unknown()) });
 export const reactionSchema = z.object({ emoji: z.string().min(1).max(64) });
 
 const optionalInt = z.preprocess((v) => (v === undefined || v === '' ? undefined : Number(v)), z.number().int().min(0).optional());
